@@ -122,6 +122,7 @@ async def test_login_refresh_restart_logout(tmp_path):
 
 async def test_token_import_verifies_before_replacing(tmp_path):
     def handler(request):
+        assert request.url.path == "/api/v2/~me"
         signed_request(request, "candidate")
         return httpx.Response(401, json={"code": 123, "msg": "invalid token candidate"})
 
@@ -137,7 +138,15 @@ async def test_token_import_verifies_before_replacing(tmp_path):
 
 
 async def test_import_success(tmp_path):
-    client = make_client(tmp_path, lambda _: httpx.Response(200, json={"id": "456"}))
+    def handler(request):
+        signed_request(request, "new")
+        # /user/me resolves the public user whose username is literally "me".
+        if request.url.path == "/api/v2/user/me":
+            return httpx.Response(200, json={"id": "999", "uid": "me"})
+        assert request.url.path == "/api/v2/~me"
+        return httpx.Response(200, json={"id": "456", "uid": "current-account"})
+
+    client = make_client(tmp_path, handler)
     try:
         result = await client.import_token("new", "refresh", 3600)
         assert result["user_id"] == "456"
@@ -163,7 +172,7 @@ async def test_expired_token_refresh_once_under_concurrency(tmp_path):
         {"access_token": "expired", "refresh_token": "refresh", "expires_at": time.time() - 1},
     )
     try:
-        await asyncio.gather(*(client.get("/api/v2/user/me") for _ in range(3)))
+        await asyncio.gather(*(client.get("/api/v2/~me") for _ in range(3)))
         assert len(refreshes) == 1
         assert client.store.read("credentials.json")["refresh_token"] == "refresh"
     finally:
@@ -275,7 +284,7 @@ async def test_api_errors_and_redirects(tmp_path, status, payload, code):
     client = make_client(tmp_path, lambda _: httpx.Response(status, json=payload))
     try:
         with pytest.raises(FrodoError) as error:
-            await client.get("/api/v2/user/me")
+            await client.get("/api/v2/~me")
         assert error.value.code == code
     finally:
         await client.close()

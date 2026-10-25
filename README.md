@@ -42,7 +42,7 @@ Grok Bot / MCPHub stdio backend 配置见 [examples/mcp.json](examples/mcp.json)
 .venv/bin/douban-mcp logout
 ```
 
-已有豆瓣 App access token 可通过 `.venv/bin/douban-mcp import-token` 隐藏输入，服务会先调用 `/api/v2/user/me` 验证，再替换本地凭据。MCP 同时提供 login/import/refresh/logout 工具；工具参数可能进入宿主的聊天或调用历史，建议常规登录使用本机 CLI。
+已有豆瓣 App access token 可通过 `.venv/bin/douban-mcp import-token` 隐藏输入，服务会先调用 `/api/v2/~me` 验证，再替换本地凭据。MCP 同时提供 login/import/refresh/logout 工具；工具参数可能进入宿主的聊天或调用历史，建议常规登录使用本机 CLI。
 
 登录请求使用 `/service/auth2/token` 的 password grant；token 保存在本地专用目录 `~/.local/state/douban-mcp/credentials.json`，目录权限 0700、文件权限 0600。密码仅参与当次请求。token 更新使用原子替换及进程锁；已知有效期临近到期时，下一次请求会尝试 refresh grant。设备 ID 持久化在同目录 `device.json`。`logout` 删除本服务的本地 token。
 

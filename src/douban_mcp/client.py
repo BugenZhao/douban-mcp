@@ -491,8 +491,9 @@ class FrodoClient:
         async with self._auth_lock:
             with self.store.locked():
                 self._clear_login_challenge()
+                # Frodo's authenticated identity endpoint is /~me. /user/me is a public username.
                 # Validate the proposed identity before replacing the existing session.
-                me = await self._send("GET", "/api/v2/user/me", token=access_token)
+                me = await self._send("GET", "/api/v2/~me", token=access_token)
                 if not isinstance(me, dict) or not me.get("id"):
                     raise FrodoError("invalid_token", "Frodo did not return a user identity")
                 self._save_token(

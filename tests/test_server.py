@@ -99,3 +99,50 @@ async def test_tool_routes(tmp_path, name, args, path, params):
         assert len(requests) == 1
     finally:
         await client.close()
+
+
+async def test_me_uses_authenticated_identity_instead_of_public_username(tmp_path):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer current-token"
+        if request.url.path == "/api/v2/user/me":
+            return httpx.Response(200, json={"id": "999", "uid": "me"})
+        assert request.url.path == "/api/v2/~me"
+        return httpx.Response(200, json={"id": "456", "uid": "current-account"})
+
+    client = FrodoClient(
+        Settings(state_dir=tmp_path, request_interval=0), transport=httpx.MockTransport(handler)
+    )
+    # Even a stale ID saved by the former token importer must not choose the public profile.
+    client.store.write("credentials.json", {"access_token": "current-token", "user_id": "999"})
+    try:
+        result = await create_server(client).call_tool("douban_me", {})
+        profile = json.loads(result[0].text)
+        assert profile == {"id": "456", "uid": "current-account"}
+        assert len(requests) == 1
+    finally:
+        await client.close()
+
+
+async def test_me_rejected_token_is_not_replaced_by_public_profile(tmp_path):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/api/v2/user/me":
+            return httpx.Response(200, json={"id": "999", "uid": "me"})
+        assert request.url.path == "/api/v2/~me"
+        return httpx.Response(401, json={"code": 123, "msg": "invalid token"})
+
+    client = FrodoClient(
+        Settings(state_dir=tmp_path, request_interval=0), transport=httpx.MockTransport(handler)
+    )
+    client.store.write("credentials.json", {"access_token": "expired-token", "user_id": "456"})
+    try:
+        with pytest.raises(ToolError, match="invalid token"):
+            await create_server(client).call_tool("douban_me", {})
+        assert len(requests) == 1
+    finally:
+        await client.close()

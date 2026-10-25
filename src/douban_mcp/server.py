@@ -215,7 +215,7 @@ def create_server(client: FrodoClient | None = None) -> FastMCP:
     @tool()
     async def douban_me() -> dict:
         """在线验证登录并返回当前账号资料。"""
-        return await client.get("/api/v2/user/me", require_auth=True)
+        return await client.get("/api/v2/~me", require_auth=True)
 
     @tool()
     async def douban_my_interest(subject_type: SubjectType, subject_id: ID) -> dict:
