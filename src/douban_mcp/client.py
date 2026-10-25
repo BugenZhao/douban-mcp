@@ -5,9 +5,10 @@ import base64
 import hashlib
 import hmac
 import re
+import secrets
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 
 import httpx
 
@@ -19,8 +20,15 @@ ORIGIN = "https://frodo.douban.com"
 
 class FrodoError(Exception):
     def __init__(
-        self, code: str, message: str, *, status: int | None = None, outcome_unknown: bool = False
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int | None = None,
+        outcome_unknown: bool = False,
+        verification_user_id: str | None = None,
     ):
+        self.verification_user_id = verification_user_id
         self.code = code
         self.message = message
         self.status = status
@@ -63,12 +71,22 @@ class FrodoClient:
             transport=transport,
             headers={"User-Agent": settings.user_agent, "Accept": "application/json"},
         )
+        self._accounts = httpx.AsyncClient(
+            timeout=settings.timeout,
+            proxy=settings.proxy,
+            trust_env=False,
+            follow_redirects=False,
+            transport=transport,
+        )
+        self._pending_login: dict | None = None
         self._pace_lock = asyncio.Lock()
         self._auth_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._last_request = 0.0
 
     async def close(self):
+        self._clear_login_challenge()
+        await self._accounts.aclose()
         await self._http.aclose()
 
     async def _send(
@@ -163,9 +181,27 @@ class FrodoClient:
                         code.replace(secret, "[redacted]"),
                         message.replace(secret, "[redacted]"),
                     )
+            verification_user_id = None
+            if code == "9000" and path == "/service/auth2/token":
+                extra = payload.get("extra")
+                uri = extra.get("solution_uri") if isinstance(extra, dict) else None
+                if isinstance(uri, str):
+                    try:
+                        parsed = urlsplit(uri)
+                    except ValueError:
+                        parsed = urlsplit("")
+                    if (
+                        parsed.scheme == "douban"
+                        and parsed.netloc == "douban.com"
+                        and parsed.path == "/account/login_verify_phone"
+                    ):
+                        values = parse_qs(parsed.query).get("user_id", [])
+                        if len(values) == 1 and re.fullmatch(r"[0-9]{1,30}", values[0]):
+                            verification_user_id = values[0]
             raise FrodoError(
                 code[:80],
                 message[:500],
+                verification_user_id=verification_user_id,
                 status=response.status_code,
                 outcome_unknown=method != "GET" and response.status_code >= 500,
             )
@@ -214,26 +250,236 @@ class FrodoClient:
             "douban_udid": hashlib.sha1(device.encode()).hexdigest(),
         }
 
-    async def login(self, username: str, password: str) -> dict:
-        if not username.strip() or not password:
-            raise FrodoError("credentials_required", "Username and password are required")
+    def _clear_login_challenge(self):
+        self._pending_login = None
+        self._accounts.cookies.clear()
+        self._accounts.headers.clear()
+
+    def _challenge_status(self) -> dict:
+        pending = self._pending_login
+        return {
+            "authenticated": False,
+            "verification_required": True,
+            "sms_sent": True,
+            "challenge_id": pending["id"],
+            "expires_at": pending["expires_at"],
+            "message": "短信已发送至账号绑定的手机号；请提交验证码完成登录。",
+        }
+
+    async def _account_request(self, method: str, url: str, *, data=None) -> httpx.Response:
+        # Callers supply only fixed Douban endpoints or checked bootstrap redirects.
+        async with self._pace_lock:
+            await asyncio.sleep(
+                max(0, self.settings.request_interval - (time.monotonic() - self._last_request))
+            )
+            self._last_request = time.monotonic()
+            try:
+                return await self._accounts.request(method, url, data=data)
+            except httpx.HTTPError:
+                raise FrodoError(
+                    "verification_network_error",
+                    "手机号验证请求失败；请检查网络。短信发送和校验均只尝试一次。",
+                    outcome_unknown=method == "POST",
+                ) from None
+
+    async def _phone_api(self, action: str, user_id: str, sms_code: str | None = None) -> dict:
+        form = {"user_id": user_id}
+        if action == "request_phone_code":
+            form["apikey"] = self.settings.api_key
+        else:
+            form.update(client_id=self.settings.api_key, phone_code=sms_code)
+        response = await self._account_request(
+            "POST", "https://accounts.douban.com/j/app/verify_phone/" + action, data=form
+        )
+        try:
+            result = response.json()
+        except ValueError:
+            result = None
+        if not isinstance(result, dict):
+            raise FrodoError(
+                "verification_invalid_response",
+                "手机号验证返回了异常响应。",
+                status=response.status_code,
+                outcome_unknown=True,
+            )
+        if response.is_success and result.get("status") == "success":
+            payload = result.get("payload")
+            return payload if isinstance(payload, dict) else {}
+        # Account responses may echo credentials or contain captcha URLs. Return fixed messages.
+        reason = result.get("message")
+        payload = result.get("payload")
+        captcha = isinstance(payload, dict) and any(
+            payload.get(k)
+            for k in ("captcha_id", "tc_app_id", "touch_cap_url", "captcha_image_url")
+        )
+        if captcha or (isinstance(reason, str) and "captcha" in reason):
+            code, message = (
+                "captcha_required",
+                "豆瓣要求图形验证，请在官方 App 完成验证后重新登录。",
+            )
+        elif not response.is_success:
+            code, message = "verification_http_error", "手机号验证服务请求失败，请稍后重新登录。"
+        elif action == "verify_phone_code":
+            code, message = "sms_verification_failed", "短信校验失败；请检查验证码及有效期。"
+        else:
+            code, message = (
+                "sms_send_failed",
+                "短信发送失败；请稍后重新登录，或在官方 App 检查账号保护。",
+            )
+        raise FrodoError(
+            code, message, status=response.status_code, outcome_unknown=response.status_code >= 500
+        )
+
+    async def _begin_phone_verification(self, user_id: str, device: str) -> dict:
+        self._accounts.cookies.update(self._http.cookies)
+        self._accounts.headers.update(
+            {
+                "User-Agent": f"Mozilla/5.0 (Linux; Android 6.0) AppleWebKit/537.36 "
+                f"Chrome/130.0.0.0 Mobile Safari/537.36 udid/{device} "
+                "com.douban.frodo/7.22.0 DoubanApp",
+                "X-Requested-With": "com.douban.frodo",
+            }
+        )
+        page = "https://accounts.douban.com/passport/verify_phone?" + urlencode(
+            {"user_id": user_id, "dark_mode": "0"}
+        )
+        url = "https://www.douban.com/accounts/auth2_redir?" + urlencode({"url": page})
+        allowed = {
+            ("www.douban.com", "/accounts/auth2_redir"),
+            ("accounts.douban.com", "/passport/verify_phone"),
+            ("accounts.douban.com", "/login"),
+            ("accounts.douban.com", "/passport/login"),
+        }
+        for _ in range(5):
+            parsed = urlsplit(url)
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc not in {"www.douban.com", "accounts.douban.com"}
+                or (parsed.netloc, parsed.path) not in allowed
+            ):
+                raise FrodoError("verification_redirect", "手机号验证会话返回了意外跳转。")
+            response = await self._account_request("GET", url)
+            if response.is_redirect and response.headers.get("location"):
+                url = urljoin(url, response.headers["location"])
+                continue
+            if not response.is_success:
+                raise FrodoError(
+                    "verification_session_failed",
+                    "手机号验证会话初始化失败。",
+                    status=response.status_code,
+                )
+            break
+        else:
+            raise FrodoError("verification_redirect", "手机号验证会话跳转次数过多。")
+        self._accounts.headers.update(
+            {
+                "Origin": "https://accounts.douban.com",
+                "Referer": page,
+                "X-CSRF-TOKEN": "undefined",
+                "Accept": "application/json, text/plain, */*",
+            }
+        )
+        await self._phone_api("request_phone_code", user_id)
+        self._pending_login = {
+            "id": secrets.token_hex(16),
+            "user_id": user_id,
+            "device": device,
+            "expires_at": time.time() + 600,
+            "attempts": 0,
+        }
+        return self._challenge_status()
+
+    async def login(
+        self,
+        username: str | None = None,
+        password: str | None = None,
+        *,
+        sms_code: str | None = None,
+        challenge_id: str | None = None,
+    ) -> dict:
         async with self._auth_lock:
+            if sms_code is not None or challenge_id is not None:
+                if username is not None or password is not None:
+                    raise FrodoError(
+                        "invalid_login_step", "验证步骤仅需 challenge_id 和 sms_code。"
+                    )
+                pending = self._pending_login
+                if pending and pending["expires_at"] <= time.time():
+                    self._clear_login_challenge()
+                    pending = None
+                if (
+                    not pending
+                    or not isinstance(challenge_id, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", challenge_id)
+                    or not secrets.compare_digest(challenge_id, pending["id"])
+                ):
+                    raise FrodoError(
+                        "login_challenge_expired", "验证会话已失效，请重新输入账号密码登录。"
+                    )
+                if not isinstance(sms_code, str) or not re.fullmatch(r"[0-9]{4,8}", sms_code):
+                    raise FrodoError("invalid_sms_code", "请输入 4–8 位数字短信验证码。")
+                with self.store.locked():
+                    device = self.settings.device_id or self.store.read("device.json").get(
+                        "device_id"
+                    )
+                    if device != pending["device"]:
+                        self._clear_login_challenge()
+                        raise FrodoError("login_challenge_expired", "设备信息已变化，请重新登录。")
+                    pending["attempts"] += 1
+                    try:
+                        payload = await self._phone_api(
+                            "verify_phone_code", pending["user_id"], sms_code
+                        )
+                        if str(payload.get("douban_user_id")) != pending["user_id"]:
+                            raise FrodoError(
+                                "invalid_token_response", "验证响应中的账号信息不匹配。"
+                            )
+                        self._save_token(payload)
+                    except FrodoError:
+                        if pending["attempts"] >= 5:
+                            self._clear_login_challenge()
+                        raise
+                    self._clear_login_challenge()
+                return self.auth_status()
+            if not username or not username.strip() or not password:
+                raise FrodoError("credentials_required", "Username and password are required")
+            self._clear_login_challenge()
+            # The login cookie jar is scoped to this attempt; credentials stay in the form only.
+            self._http.cookies.clear()
             device = self._device_params()
             with self.store.locked():
-                payload = await self._send(
-                    "POST",
-                    "/service/auth2/token",
-                    data={
-                        "client_id": self.settings.api_key,
-                        "client_secret": self.settings.api_secret,
-                        "grant_type": "password",
-                        "username": username.strip(),
-                        "password": password,
-                        "redirect_uri": "frodo://app/oauth/callback/",
-                        "disable_account_create": "false",
-                        **device,
-                    },
-                )
+                try:
+                    payload = await self._send(
+                        "POST",
+                        "/service/auth2/token",
+                        data={
+                            "client_id": self.settings.api_key,
+                            "client_secret": self.settings.api_secret,
+                            "grant_type": "password",
+                            "username": username.strip(),
+                            "password": password,
+                            "redirect_uri": "frodo://app/oauth/callback/",
+                            "disable_account_create": "false",
+                            **device,
+                        },
+                    )
+                except FrodoError as exc:
+                    if exc.code != "9000":
+                        raise
+                    if not exc.verification_user_id:
+                        raise FrodoError(
+                            "verification_context_missing",
+                            "豆瓣要求手机号验证，但返回的验证上下文不完整，请重新登录。",
+                        ) from None
+                    try:
+                        return await self._begin_phone_verification(
+                            exc.verification_user_id, device["device_id"]
+                        )
+                    except BaseException:
+                        self._clear_login_challenge()
+                        raise
+                finally:
+                    self._http.cookies.clear()
                 self._save_token(payload)
         return self.auth_status()
 
@@ -244,6 +490,7 @@ class FrodoClient:
             raise FrodoError("invalid_token", "Supply the token value without the Bearer prefix")
         async with self._auth_lock:
             with self.store.locked():
+                self._clear_login_challenge()
                 # Validate the proposed identity before replacing the existing session.
                 me = await self._send("GET", "/api/v2/user/me", token=access_token)
                 if not isinstance(me, dict) or not me.get("id"):
@@ -287,6 +534,7 @@ class FrodoClient:
     async def logout(self) -> dict:
         async with self._auth_lock:
             with self.store.locked():
+                self._clear_login_challenge()
                 self.store.clear_tokens()
         return {"authenticated": False, "scope": "local_credentials_removed"}
 

@@ -1,6 +1,6 @@
 # douban-mcp
 
-基于豆瓣 App Frodo API 的本地 stdio MCP server，支持匿名查询、账号登录与书影音标记。直接通过 HTTPS 请求 `frodo.douban.com`，使用 apiKey + HMAC-SHA1 签名。运行时网络仅用于用户触发的豆瓣请求，项目与运行依赖均无 telemetry/analytics SDK。
+基于豆瓣 App Frodo API 的本地 stdio MCP server，支持匿名查询、账号登录与书影音标记。直接通过 HTTPS 请求 `frodo.douban.com`，使用 apiKey + HMAC-SHA1 签名；账号保护验证使用豆瓣账号服务的 HTTP 接口。运行时网络仅用于用户触发的豆瓣请求，项目与运行依赖均无 telemetry/analytics SDK。
 
 ## 安装与运行
 
@@ -50,7 +50,16 @@ Grok Bot / MCPHub stdio backend 配置见 [examples/mcp.json](examples/mcp.json)
 
 源码中的 apiKey 与 HMAC secret 是 Frodo App 的共享客户端常量。个人 access token、refresh token 和设备 ID 保存在本机状态目录；`.gitignore` 排除这些状态文件。`.gitleaks.toml` 仅对指定源文件中的两项固定 App 常量设置精确白名单，其余默认密钥检测规则保持启用。
 
-豆瓣可能返回 `invalid_device_id`、验证码或异地登录验证。服务会返回错误，用户可在官方 App 完成验证后重试，或导入已有 token。账号密码登录与实际账号写入需要有效凭据才能完成端到端验收。
+遇到账号保护错误 `9000` 时，CLI 自动向绑定手机号发送一次短信，并提示隐藏输入验证码；验证成功后保存 App token。验证码错误时可重新输入，最多尝试 5 次。超时或发送失败会明确报错，重新运行 `login` 可开启新的验证会话。
+
+MCP 的 `douban_login` 支持两步调用：
+
+1. 传入 `username`、`password`。需要短信时返回 `verification_required: true`、`sms_sent: true`、`challenge_id` 和 `expires_at`。
+2. 在同一个 MCP 服务进程中，仅传入上一步的 `challenge_id` 和 `sms_code`。成功后返回脱敏登录状态。
+
+验证上下文和 Cookie 仅保存在内存，有效期 10 分钟；重启、退出登录或发起新的登录会使原会话失效。短信发送和校验请求均只发送一次，普通验证码错误可由用户再次提交。密码、验证码和验证 Cookie 都不会写入状态文件。图形验证码返回 `captcha_required`，用户需在官方 App 完成验证后重试。`invalid_device_id` 等其他错误保持明确报错。
+
+短信流程依据和测试范围见 [docs/phone-verification.md](docs/phone-verification.md)。完整短信登录与实际账号写入需要用户在本机使用有效凭据完成端到端验收。
 
 ## 工具
 
@@ -99,7 +108,7 @@ Grok Bot / MCPHub stdio backend 配置见 [examples/mcp.json](examples/mcp.json)
 | `DOUBAN_TIMEOUT` | 20 秒 | HTTP 超时 |
 | `DOUBAN_REQUEST_INTERVAL` | 1.2 秒 | 单进程请求间隔 |
 
-HTTP 客户端使用显式代理配置。服务默认直连；代理地址按本机网络配置设置。TLS 校验证书，重定向保持关闭，HTTP 日志关闭；token、密码和完整带签名 URL 均从错误输出中剔除。无后台轮询、远程错误上报或遥测开关。
+HTTP 客户端使用显式代理配置。服务默认直连；代理地址按本机网络配置设置。TLS 校验证书，Frodo API 重定向保持关闭；手机号验证初始化只跟随固定豆瓣域名和路径的 HTTPS 跳转，最多 5 次。HTTP 日志关闭；token、密码和完整带签名 URL 均从错误输出中剔除。无后台轮询、远程错误上报或遥测开关。
 
 ## 验证
 

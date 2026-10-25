@@ -16,6 +16,24 @@ async def auth_command(command: str):
             username = input("豆瓣手机号 / 邮箱: ")
             password = getpass.getpass("密码: ")
             result = await client.login(username, password)
+            del password
+            if result.get("verification_required"):
+                print(result["message"], file=sys.stderr)
+                challenge_id = result["challenge_id"]
+                for attempt in range(5):
+                    sms_code = getpass.getpass("短信验证码: ")
+                    try:
+                        result = await client.login(challenge_id=challenge_id, sms_code=sms_code)
+                        break
+                    except FrodoError as exc:
+                        if (
+                            exc.code not in {"sms_verification_failed", "invalid_sms_code"}
+                            or attempt == 4
+                        ):
+                            raise
+                        print(exc.message, file=sys.stderr)
+                    finally:
+                        del sms_code
         elif command == "import-token":
             token = getpass.getpass("Access token: ")
             refresh = getpass.getpass("Refresh token（可留空）: ") or None

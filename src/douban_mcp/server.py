@@ -78,9 +78,18 @@ def create_server(client: FrodoClient | None = None) -> FastMCP:
         return client.auth_status()
 
     @tool(write=True)
-    async def douban_login(username: str, password: str) -> dict:
-        """账号密码换取并保存 token；推荐通过本机 CLI 登录以减少凭据进入聊天记录。风控错误原样提示。"""
-        return await client.login(username, password)
+    async def douban_login(
+        username: str | None = None,
+        password: str | None = None,
+        sms_code: str | None = None,
+        challenge_id: str | None = None,
+    ) -> dict:
+        """账号密码登录。9000 自动发送短信并返回 verification_required 和 challenge_id。
+
+        第二次仅传 challenge_id、sms_code，成功后保存 token 并返回脱敏状态。
+        验证会话有效期 10 分钟，重启服务后需重新登录。推荐本机 CLI 隐藏输入凭据。
+        """
+        return await client.login(username, password, sms_code=sms_code, challenge_id=challenge_id)
 
     @tool(write=True)
     async def douban_import_token(
