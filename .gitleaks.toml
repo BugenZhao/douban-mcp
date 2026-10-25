@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public Frodo Android app constants, shared by all clients"
+condition = "AND"
+paths = ['''(^|/)src/douban_mcp/config\.py$''']
+regexTarget = "secret"
+regexes = ['''^(0dad551ec0f84ed02907ff5c42e8ec70|bf7dddc7c9cfe6f7)$''']

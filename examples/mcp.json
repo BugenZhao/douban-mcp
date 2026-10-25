@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "douban": {
+      "command": "/absolute/path/to/douban-mcp/.venv/bin/douban-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
